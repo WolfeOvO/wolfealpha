@@ -1,0 +1,13 @@
+services:
+  wolfealpha:
+    build: .
+    container_name: wolfealpha
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:9410:9410"
+    volumes:
+      - ./data:/app/data
+    environment:
+      WA_CACHE_TTL: "259200"
+      WA_GLOBAL_DAILY_LIMIT: "800"
+      WA_PER_IP_PER_MIN: "20"
