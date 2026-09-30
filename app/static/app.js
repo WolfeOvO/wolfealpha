@@ -130,7 +130,10 @@
     "melting point": "熔点",
     "boiling point": "沸点",
     "phase": "相态",
-    "phase at STP": "标准状态相态",
+    "gas": "气态",
+    "liquid": "液态",
+    "solid": "固态",
+    "phase at stp": "标准状态相态",
     "atomic number": "原子序数",
     "atomic mass": "原子质量",
     "element": "元素",
@@ -142,7 +145,7 @@
     "physical properties": "物理性质",
     "chemical properties": "化学性质",
     "structure": "结构",
-    "3D structure": "三维结构",
+    "3d structure": "三维结构",
     "structure diagram": "结构示意图",
     "oxidation states": "氧化态",
     "solubility": "溶解度",
@@ -245,8 +248,11 @@
   function translatable(s) {
     if (!s || s.length > 380) return false;
     if (/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(s)) return false;
+    if (/^[A-Z][a-z]?$/.test(s)) return false;   /* element symbols (Li, Na, ...) stay as-is */
     if (!/[A-Za-z]{2,}/.test(s)) return false;
-    if (s.length <= 80 && /[\^_=]/.test(s)) return false;
+    /* mathy characters only skip the string when it is not mostly words
+       (e.g. "melting point T_m" gets translated; "W/H^2" stays as-is) */
+    if (s.length <= 80 && /[\^_=]/.test(s) && (s.match(/[A-Za-z]{4,}/g) || []).length < 2) return false;
     if (s.indexOf("->") >= 0) return false;
     if (/[a-z]{2,5}\(/i.test(s)) return false;
     if (!/[A-Za-z]{4,}/.test(s) && /[0-9]/.test(s)) return false;
@@ -261,15 +267,75 @@
     if (TR[vis] !== undefined) return TR[vis];
     return null;
   }
+  /* deterministic display fixes applied even without machine translation */
+  function localizeLower(s) {
+    return s.replace(/\(rank:\s*(\d+)(?:st|nd|rd|th)\)/gi, function (m, n) { return "（排名：第" + n + "位）"; });
+  }
   function textHTML(s) {           /* s: raw text (may contain \-escapes) */
     var zh = trText(s);
     if (zh !== null) return esc(zh);
-    return md.renderInline(stripEsc(s));
+    var vis = stripEsc(s);
+    var loc = localizeLower(vis);
+    if (loc !== vis) return esc(loc);
+    return md.renderInline(vis);
   }
   function cellHTML(c) {           /* table cell, preserving md when untranslated */
     var zh = trText(c);
     if (zh !== null) return esc(zh);
+    var vis = stripEsc(c);
+    var loc = localizeLower(vis);
+    if (loc !== vis) return esc(loc);
     return md.renderInline(c);
+  }
+
+  /* ---- math notation rendering: sub/superscripts (T_m, 10^-7, K^(-1), H_2O) ---- */
+  function mathifyDOM(root) {
+    var walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+      acceptNode: function (n) {
+        var p = n.parentNode;
+        while (p && p !== root) {
+          var nm = p.nodeName;
+          if (nm === "PRE" || nm === "CODE" || nm === "A" || nm === "SCRIPT" || nm === "STYLE") {
+            return NodeFilter.FILTER_REJECT;
+          }
+          p = p.parentNode;
+        }
+        return NodeFilter.FILTER_ACCEPT;
+      }
+    }, false);
+    var nodes = [], tn;
+    while ((tn = walker.nextNode())) { nodes.push(tn); }
+    nodes.forEach(function (node) {
+      var s = node.nodeValue;
+      if (!s || (s.indexOf("_") === -1 && s.indexOf("^") === -1)) return;
+      var frag = mathifyFragment(s);
+      if (frag) { node.parentNode.replaceChild(frag, node); }
+    });
+  }
+  function mathifyFragment(s) {
+    var re = /([A-Za-z0-9\)\]])((?:[_^](?:\([A-Za-z0-9+\-]{1,6}\)|[+\-]?\d+|[A-Za-z][A-Za-z0-9]{0,7}))+)/g;
+    var last = 0, m, out = document.createDocumentFragment(), changed = false;
+    while ((m = re.exec(s))) {
+      if (m.index > last) { out.appendChild(document.createTextNode(s.slice(last, m.index))); }
+      out.appendChild(document.createTextNode(m[1]));
+      var parts = m[2].match(/[_^](?:\([A-Za-z0-9+\-]{1,6}\)|[+\-]?\d+|[A-Za-z][A-Za-z0-9]{0,7})/g) || [];
+      parts.forEach(function (p) {
+        var inner = p.slice(1);
+        if (inner.length > 1 && inner[0] === "(" && inner[inner.length - 1] === ")") { inner = inner.slice(1, -1); }
+        var el = document.createElement(p[0] === "_" ? "sub" : "sup");
+        el.textContent = inner;
+        out.appendChild(el);
+      });
+      last = m.index + m[0].length;
+      changed = true;
+    }
+    if (!changed) { return null; }
+    if (last < s.length) { out.appendChild(document.createTextNode(s.slice(last))); }
+    return out;
+  }
+  function setResultHTML(html) {
+    resultEl.innerHTML = html;
+    mathifyDOM(resultEl);
   }
   function trLine(l) {
     var zh = trText(l);
@@ -451,13 +517,13 @@
       var msg = d.translated_to
         ? ("已由机器翻译为「" + esc(d.translated_to) + "」提交查询，但 Wolfram 没有找到对应结果——换个说法再试试。")
         : "Wolfram 没有找到对应结果。提示：Wolfram|Alpha 以英文查询为主，换个说法或改用英文再试试。";
-      resultEl.innerHTML = html + "<section class='pod'><div class='md'><p>" + msg + "</p></div></section>";
+      setResultHTML(html + "<section class='pod'><div class='md'><p>" + msg + "</p></div></section>");
       return;
     }
     secs.forEach(function (s) {
       if (s.title || s.lines.join("").trim()) { html += renderSection(s.title, s.lines); }
     });
-    resultEl.innerHTML = html;
+    setResultHTML(html);
   }
 
   /* ---- recent queries ---- */

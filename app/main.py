@@ -223,9 +223,11 @@ def _needs_tr(s):
         return False
     if CJK_RE.search(s):
         return False
+    if re.fullmatch(r"[A-Z][a-z]?", s):
+        return False  # element symbols (Li, Na, ...) stay as-is
     if not re.search(r"[A-Za-z]{2,}", s):
         return False
-    if len(s) <= 80 and re.search(r"[\^_=]", s):
+    if len(s) <= 80 and re.search(r"[\^_=]", s) and len(re.findall(r"[A-Za-z]{4,}", s)) < 2:
         return False
     if "->" in s:
         return False
