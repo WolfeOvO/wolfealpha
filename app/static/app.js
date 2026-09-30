@@ -12,6 +12,33 @@
     return linkOpen(t, i, o, e, s);
   };
 
+  /* common pod titles -> Chinese (display only) */
+  var TITLES = {
+    "input interpretation": "输入解析",
+    "input": "输入",
+    "result": "结果",
+    "results": "结果",
+    "plot": "图表",
+    "root plot": "根分布图",
+    "number line": "数轴",
+    "sum of roots": "根之和",
+    "product of roots": "根之积",
+    "unit conversions": "单位换算",
+    "number name": "数字读法",
+    "decimal form": "小数形式",
+    "exact result": "精确结果",
+    "visual representation": "可视化",
+    "real number line": "实数轴",
+    "input information": "输入信息",
+    "equation": "方程",
+    "solution": "解",
+    "solutions": "解",
+    "value": "数值",
+    "values": "数值",
+    "current time": "当前时间",
+    "population history": "人口历史"
+  };
+
   function esc(s) {
     return String(s).replace(/[&<>"]/g, function (c) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
@@ -109,7 +136,8 @@
     flushPipes(); flushAscii(); flushMd();
 
     if (!blocks.length) return "";
-    var h = title ? "<h3 class='pod-title'>" + esc(title) + "</h3>" : "";
+    var dispTitle = title ? (TITLES[title.toLowerCase()] || title) : "";
+    var h = dispTitle ? "<h3 class='pod-title'>" + esc(dispTitle) + "</h3>" : "";
     return "<section class='pod'>" + h + blocks.join("") + "</section>";
   }
 
@@ -130,6 +158,9 @@
     html += "</div>";
     if (d.translated_to) {
       html += "<div class='transnote'>已自动翻译为英文查询：<b>" + esc(d.translated_to) + "</b>（Wolfram 仅支持英文输入）</div>";
+    }
+    if (d.mt_failed) {
+      html += "<div class='transnote warn'>⚠️ 机翻服务暂时不可用，本次已按原文提交。建议稍后重试，或直接用英文查询。</div>";
     }
     if (/^\s*No Results Found/i.test(d.raw)) {
       var msg = d.translated_to
@@ -202,6 +233,7 @@
         statusEl.className = "status";
         if (d.cached) { statusEl.textContent = "⚡ 命中缓存"; }
         else { statusEl.textContent = "✓ 实时计算" + (d.ms ? " · " + d.ms + " ms" : ""); }
+        if (d.translated_to) { statusEl.textContent += " · 已机翻"; }
         saveRecent(q);
       })
       .catch(function (e) {

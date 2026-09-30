@@ -164,30 +164,32 @@ def _parse_clients5(data):
 
 
 async def translate_to_en(text):
-    """Translate a Chinese query to English. Returns None if not needed/failed."""
+    """Translate Chinese query to English. Returns None if not needed or failed.
+    Two full passes over the provider chain to absorb transient failures."""
     if not CJK_RE.search(text):
         return None
     headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"}
     async with httpx.AsyncClient(timeout=12.0, follow_redirects=True, headers=headers) as client:
-        # 1) Google clients5 (dict-chrome-ex)
-        try:
-            r = await client.get(GOOGLE_MT, params={"client": "dict-chrome-ex", "sl": "auto", "tl": "en", "q": text})
-            r.raise_for_status()
-            out = _parse_clients5(r.json())
-            if out and not CJK_RE.search(out):
-                return out.strip()[:MAX_QUERY_LEN]
-        except Exception:
-            pass
-        # 2) MyMemory
-        try:
-            r = await client.get(MYMEMORY_MT, params={"q": text, "langpair": "zh-CN|en"})
-            r.raise_for_status()
-            d = r.json()
-            out = _html.unescape((d.get("responseData") or {}).get("translatedText") or "").strip()
-            if out and out.lower() != text.lower() and not CJK_RE.search(out):
-                return out.strip()[:MAX_QUERY_LEN]
-        except Exception:
-            pass
+        for _pass in range(2):
+            # 1) Google clients5 (dict-chrome-ex)
+            try:
+                r = await client.get(GOOGLE_MT, params={"client": "dict-chrome-ex", "sl": "auto", "tl": "en", "q": text})
+                r.raise_for_status()
+                out = _parse_clients5(r.json())
+                if out and not CJK_RE.search(out):
+                    return out.strip()[:MAX_QUERY_LEN]
+            except Exception:
+                pass
+            # 2) MyMemory
+            try:
+                r = await client.get(MYMEMORY_MT, params={"q": text, "langpair": "zh-CN|en"})
+                r.raise_for_status()
+                d = r.json()
+                out = _html.unescape((d.get("responseData") or {}).get("translatedText") or "").strip()
+                if out and out.lower() != text.lower() and not CJK_RE.search(out):
+                    return out.strip()[:MAX_QUERY_LEN]
+            except Exception:
+                pass
     return None
 
 
@@ -233,7 +235,7 @@ async def call_mcp(query: str):
 # ---------- routes ----------
 @app.get("/")
 def index():
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-cache"})
 
 
 @app.get("/robots.txt")
@@ -281,6 +283,7 @@ async def api_query(request: Request):
 
     tq = await translate_to_en(q)
     effective_q = tq or q
+    mt_failed = bool(CJK_RE.search(q)) and tq is None
 
     t0 = time.time()
     try:
@@ -296,12 +299,12 @@ async def api_query(request: Request):
 
     # If it was a Chinese query and translation failed, don't cache a "No Results"
     # (so a retry can succeed once the MT endpoint recovers).
-    skip_cache = bool(CJK_RE.search(q)) and tq is None and raw.startswith("No Results")
+    skip_cache = mt_failed and raw.startswith("No Results")
     if not skip_cache:
         cache_put(qkey, q, raw, src_url, tq or "")
         daily_bump(key)
     return {"ok": True, "cached": False, "query": q, "raw": raw, "url": src_url,
-            "ms": ms, "translated_to": tq}
+            "ms": ms, "translated_to": tq, "mt_failed": mt_failed}
 
 
 ALLOWED_IMG_HOSTS = ("wolframalpha.com",)

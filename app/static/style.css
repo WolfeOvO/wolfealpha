@@ -98,6 +98,7 @@ pre.ascii{margin:10px 0 0;padding:10px 12px;background:var(--soft);border:1px so
 
 /* translation notice */
 .transnote{font-size:13px;color:#7a6420;background:#fff8e6;border:1px solid #f0e2b6;border-radius:8px;padding:7px 12px;margin:10px 0 0;overflow-wrap:anywhere}
+.transnote.warn{color:#8a4b08;background:#fdf3e3;border-color:#f0d9b5}
 
 /* ---------- footer ---------- */
 footer{margin-top:auto;padding:30px 0 20px;color:#9a9aa0;font-size:12.5px;text-align:center}
