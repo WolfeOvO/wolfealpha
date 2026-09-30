@@ -3,6 +3,8 @@
 # Results cached in SQLite; WA images proxied + cached locally.
 # Chinese queries auto-translated to English via free machine-translation
 # endpoints (no LLM): clients5.google.com (dict-chrome-ex) -> MyMemory.
+# Result text (en -> zh) translated lazily through /api/mt with a local cache.
+import asyncio
 import hashlib
 import html as _html
 import json
@@ -47,6 +49,7 @@ def db():
     except sqlite3.OperationalError:
         pass
     conn.execute("CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT)")
+    conn.execute("CREATE TABLE IF NOT EXISTS mt (src TEXT PRIMARY KEY, dst TEXT, ts REAL)")
     return conn
 
 
@@ -90,6 +93,7 @@ def norm_key(q):
 
 # ---------- rate limiting ----------
 _ip_hits = defaultdict(deque)
+_mt_hits = defaultdict(deque)
 
 
 def ip_allowed(ip):
@@ -98,6 +102,17 @@ def ip_allowed(ip):
     while dq and now - dq[0] > 60:
         dq.popleft()
     if len(dq) >= PER_IP_PER_MIN:
+        return False
+    dq.append(now)
+    return True
+
+
+def mt_ip_allowed(ip):
+    now = time.time()
+    dq = _mt_hits[ip]
+    while dq and now - dq[0] > 60:
+        dq.popleft()
+    if len(dq) >= 60:
         return False
     dq.append(now)
     return True
@@ -147,7 +162,9 @@ MYMEMORY_MT = "https://api.mymemory.translated.net/get"
 
 
 def _parse_clients5(data):
-    """clients5 response shape: [[text, src_lang]] (occasionally multiple segments)."""
+    """clients5 response shapes: [["text","src"], ...] (zh->en) or ["text"] (en->zh)."""
+    if isinstance(data, list) and data and isinstance(data[0], str):
+        return data[0].strip() or None
     try:
         inner = data[0]
     except Exception:
@@ -188,6 +205,75 @@ async def translate_to_en(text):
                 out = _html.unescape((d.get("responseData") or {}).get("translatedText") or "").strip()
                 if out and out.lower() != text.lower() and not CJK_RE.search(out):
                     return out.strip()[:MAX_QUERY_LEN]
+            except Exception:
+                pass
+    return None
+
+
+# ---------- result-text translation (en -> zh) ----------
+MT_SEM = asyncio.Semaphore(8)
+MT_MAX_ITEM = 380
+MT_REQ_MAX = 250
+
+
+def _needs_tr(s):
+    """Only translate strings that carry real English words and are not
+    formulas/unit fragments (those stay as-is, per product decision)."""
+    if not s or len(s) > MT_MAX_ITEM:
+        return False
+    if CJK_RE.search(s):
+        return False
+    if not re.search(r"[A-Za-z]{2,}", s):
+        return False
+    if len(s) <= 80 and re.search(r"[\^_=]", s):
+        return False
+    if "->" in s:
+        return False
+    if re.search(r"[a-z]{2,5}\(", s, re.I):
+        return False
+    if not re.search(r"[A-Za-z]{4,}", s) and re.search(r"\d", s):
+        return False
+    return True
+
+
+def mt_cache_get(src):
+    conn = db()
+    try:
+        row = conn.execute("SELECT dst FROM mt WHERE src=?", (src,)).fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def mt_cache_put(src, dst):
+    conn = db()
+    try:
+        conn.execute("INSERT OR REPLACE INTO mt (src, dst, ts) VALUES (?,?,?)", (src, dst, time.time()))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+async def translate_en2zh(text):
+    """Translate a result-text fragment to Chinese via the free MT chain."""
+    headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"}
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True, headers=headers) as client:
+        for _pass in range(2):
+            try:
+                r = await client.get(GOOGLE_MT, params={"client": "dict-chrome-ex", "sl": "en", "tl": "zh-CN", "q": text})
+                r.raise_for_status()
+                out = _parse_clients5(r.json())
+                if out and CJK_RE.search(out):
+                    return out.strip()[:600]
+            except Exception:
+                pass
+            try:
+                r = await client.get(MYMEMORY_MT, params={"q": text, "langpair": "en|zh-CN"})
+                r.raise_for_status()
+                d = r.json()
+                out = _html.unescape((d.get("responseData") or {}).get("translatedText") or "").strip()
+                if out and out.lower() != text.lower() and CJK_RE.search(out):
+                    return out.strip()[:600]
             except Exception:
                 pass
     return None
@@ -305,6 +391,41 @@ async def api_query(request: Request):
         daily_bump(key)
     return {"ok": True, "cached": False, "query": q, "raw": raw, "url": src_url,
             "ms": ms, "translated_to": tq, "mt_failed": mt_failed}
+
+
+@app.post("/api/mt")
+async def api_mt(request: Request):
+    """Batch en->zh translation for result-text fragments (cached server-side)."""
+    if not mt_ip_allowed(client_ip(request)):
+        return JSONResponse({"ok": False, "error": "请求太频繁，请稍后再试"}, status_code=429)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "bad request"}, status_code=400)
+    items = [str(s).strip() for s in (body.get("items") or []) if isinstance(s, str)]
+    out = {}
+    missing = []
+    for s in items[:MT_REQ_MAX]:
+        if not _needs_tr(s):
+            continue
+        c = mt_cache_get(s)
+        if c:
+            out[s] = c
+        elif s not in missing:
+            missing.append(s)
+    if missing:
+        async def _one(s):
+            async with MT_SEM:
+                r = await translate_en2zh(s)
+            return (s, r)
+        rs = await asyncio.gather(*[_one(s) for s in missing], return_exceptions=True)
+        for item in rs:
+            if isinstance(item, tuple):
+                s, r = item
+                if r:
+                    mt_cache_put(s, r)
+                    out[s] = r
+    return {"ok": True, "trans": out}
 
 
 ALLOWED_IMG_HOSTS = ("wolframalpha.com",)

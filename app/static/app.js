@@ -76,7 +76,7 @@
     "eccentricity": "离心率",
     "axis of symmetry": "对称轴",
     "domain": "定义域",
-    "range": "值域",
+    "range": "范围",
     "parity": "奇偶性",
     "periodicity": "周期性",
     "global minimum": "全局最小值",
@@ -167,6 +167,8 @@
     "largest cities": "主要城市",
     "country rank": "国家排名",
     "world rank": "世界排名",
+    "rank": "排名",
+    "foods distribution": "食物分布",
     "location": "位置",
     "map": "地图",
     "coordinates": "坐标",
@@ -193,6 +195,9 @@
     "calories": "卡路里",
     "nutritional information": "营养信息",
     "serving size": "每份含量",
+    "% daily value": "每日摄入量占比",
+    "daily amount": "每日参考量",
+    "dietary calories per day": "每日膳食热量",
     /* 统计 */
     "basic statistics": "基本统计",
     "mean": "平均值",
@@ -216,6 +221,9 @@
     "weight": "体重"
   };
 
+  /* result-text translation memory (server-backed; filled via /api/mt) */
+  var TR = {}, trCount = 0, lastD = null;
+
   function esc(s) {
     return String(s).replace(/[&<>"]/g, function (c) {
       return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
@@ -232,13 +240,93 @@
     return parts;
   }
 
+  /* ---- result translation helpers ---- */
+  /* strings we keep as-is: formulas, pure numbers, unit-only fragments */
+  function translatable(s) {
+    if (!s || s.length > 380) return false;
+    if (/[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]/.test(s)) return false;
+    if (!/[A-Za-z]{2,}/.test(s)) return false;
+    if (s.length <= 80 && /[\^_=]/.test(s)) return false;
+    if (s.indexOf("->") >= 0) return false;
+    if (/[a-z]{2,5}\(/i.test(s)) return false;
+    if (!/[A-Za-z]{4,}/.test(s) && /[0-9]/.test(s)) return false;
+    return true;
+  }
+  /* zh for a display string: curated dict -> translation memory -> null */
+  function trText(s) {
+    var vis = stripEsc(String(s)).trim();
+    if (!vis) return null;
+    var t = TITLES[vis.toLowerCase()];
+    if (t) return t;
+    if (TR[vis] !== undefined) return TR[vis];
+    return null;
+  }
+  function textHTML(s) {           /* s: raw text (may contain \-escapes) */
+    var zh = trText(s);
+    if (zh !== null) return esc(zh);
+    return md.renderInline(stripEsc(s));
+  }
+  function cellHTML(c) {           /* table cell, preserving md when untranslated */
+    var zh = trText(c);
+    if (zh !== null) return esc(zh);
+    return md.renderInline(c);
+  }
+  function trLine(l) {
+    var zh = trText(l);
+    return zh !== null ? zh : l;
+  }
+  /* collect translatable units from a result payload */
+  function collectUnits(d) {
+    var seen = {}, pending = [], total = 0;
+    function add(s) {
+      var vis = stripEsc(String(s)).trim();
+      if (!translatable(vis)) return;
+      total++;
+      if (seen[vis] || TR[vis] !== undefined || TITLES[vis.toLowerCase()]) return;
+      seen[vis] = 1; pending.push(vis);
+    }
+    (d.raw || "").split("\n").forEach(function (line) {
+      var t = line.match(/^#\s+(.*)$/);
+      if (t) { add(t[1]); return; }
+      if (/^!\[/.test(line)) return;
+      var probe = line.replace(/\\/g, "");
+      if (/^[0-9+\-=\s|]+$/.test(probe) && probe.indexOf("|") >= 0) return;
+      if (line.indexOf("\\|") >= 0) { line.split(/\s*\\\|\s*/).forEach(add); return; }
+      add(line);
+    });
+    return { pending: pending, total: total };
+  }
+  function applyTranslations(units) {
+    var chunks = [], i;
+    for (i = 0; i < units.length; i += 150) { chunks.push(units.slice(i, i + 150)); }
+    return Promise.all(chunks.map(function (ch) {
+      return fetch("/api/mt", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ items: ch })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) { return (d && d.trans) || {}; })
+        .catch(function () { return {}; });
+    })).then(function (ms) {
+      var n = 0;
+      ms.forEach(function (m) {
+        for (var k in m) {
+          if (typeof m[k] === "string" && m[k] && TR[k] !== m[k]) { TR[k] = m[k]; n++; }
+        }
+      });
+      trCount += n;
+      return n;
+    });
+  }
+
   /* ---- render one pod ---- */
   function renderSection(title, bodyLines) {
     var blocks = [], buf = [], abuf = [], pbuf = [];
 
     function flushMd() {
       if (!buf.length) return;
-      var t = buf.join("\n");
+      var t = buf.map(trLine).join("\n");
       buf = [];
       if (t.trim()) blocks.push("<div class='md'>" + md.render(t) + "</div>");
     }
@@ -273,7 +361,7 @@
         var t = ["<div class='tablewrap'><table class='watable'><tbody>"];
         rows.forEach(function (row, i) {
           var tag = i === 0 ? "th" : "td";
-          t.push("<tr>" + row.map(function (c) { return "<" + tag + ">" + md.renderInline(c) + "</" + tag + ">"; }).join("") + "</tr>");
+          t.push("<tr>" + row.map(function (c) { return "<" + tag + ">" + cellHTML(c) + "</" + tag + ">"; }).join("") + "</tr>");
         });
         t.push("</tbody></table></div>");
         blocks.push(t.join(""));
@@ -283,21 +371,26 @@
         /* "caption |" (trailing empty cell) -> plain line */
         var stripped = line.replace(/\s*\\\|\s*$/, "").trim();
         if (stripped && stripped !== line.trim() && stripped.indexOf("\\|") === -1) {
-          blocks.push("<div class='md'><p>" + md.renderInline(stripEsc(stripped)) + "</p></div>");
+          blocks.push("<div class='md'><p>" + textHTML(stripped) + "</p></div>");
           return;
         }
         var kv = line.match(/^(.*?)\s*\\?\|\s+(.+)$/);
         if (kv) {
           var k = stripEsc(kv[1]).trim();
           var v = kv[2];
+          var vparts = v.split(/\s*\\\|\s*/);
+          var vhtml = vparts.length > 1
+            ? vparts.map(function (p) { return textHTML(p); }).join(" | ")
+            : textHTML(v);
           if (k) {
-            blocks.push("<div class='kv'><span class='k'>" + esc(k) + "</span><span class='v'>" + md.renderInline(v) + "</span></div>");
+            var kz = trText(k);
+            blocks.push("<div class='kv'><span class='k'>" + (kz !== null ? esc(kz) : esc(k)) + "</span><span class='v'>" + vhtml + "</span></div>");
           } else {
-            blocks.push("<div class='kv cont'><span class='v'>" + md.renderInline(v) + "</span></div>");
+            blocks.push("<div class='kv cont'><span class='v'>" + vhtml + "</span></div>");
           }
           return;
         }
-        blocks.push("<div class='md'><p>" + md.renderInline(stripEsc(line.trim())) + "</p></div>");
+        blocks.push("<div class='md'><p>" + textHTML(line.trim()) + "</p></div>");
       });
     }
 
@@ -327,7 +420,8 @@
     flushPipes(); flushAscii(); flushMd();
 
     if (!blocks.length) return "";
-    var dispTitle = title ? (TITLES[title.toLowerCase()] || title) : "";
+    var tz = title ? trText(title) : null;
+    var dispTitle = title ? (tz !== null ? tz : title) : "";
     var h = dispTitle ? "<h3 class='pod-title'>" + esc(dispTitle) + "</h3>" : "";
     return "<section class='pod'>" + h + blocks.join("") + "</section>";
   }
@@ -421,11 +515,25 @@
           return;
         }
         renderResult(d);
-        statusEl.className = "status";
-        if (d.cached) { statusEl.textContent = "⚡ 命中缓存"; }
-        else { statusEl.textContent = "✓ 实时计算" + (d.ms ? " · " + d.ms + " ms" : ""); }
-        if (d.translated_to) { statusEl.textContent += " · 已机翻"; }
+        lastD = d;
         saveRecent(q);
+        statusEl.className = "status";
+        var base = d.cached ? "⚡ 命中缓存" : ("✓ 实时计算" + (d.ms ? " · " + d.ms + " ms" : ""));
+        if (d.translated_to) { base += " · 已机翻"; }
+        var cu = collectUnits(d);
+        if (cu.pending.length) {
+          statusEl.textContent = base + " · 机翻结果中…";
+          applyTranslations(cu.pending).then(function (n) {
+            if (lastD === d && n > 0) {
+              renderResult(d);
+              statusEl.textContent = base + " · 已转中文";
+            } else {
+              statusEl.textContent = base;
+            }
+          });
+        } else {
+          statusEl.textContent = base + (cu.total > 0 && trCount > 0 ? " · 已转中文" : "");
+        }
       })
       .catch(function (e) {
         statusEl.className = "status err";
